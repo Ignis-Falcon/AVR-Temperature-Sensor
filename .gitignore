@@ -2,3 +2,4 @@
 *.hex
 compile_commands.json
 rr.md
+.cache
