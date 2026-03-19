@@ -7,6 +7,8 @@
 #include "stm32g4xx_hal_uart.h"
 #include "usart.h"
 
+#define SIZE_STACK_SLAVE 256
+
 typedef enum {KELVIN = 0, CELSIUS = 1} type_temp;
 typedef enum {NO_LOG = 0, LOG     = 1} type_log;
 typedef enum {ZERO_S = 0, TEN_S   = 1, THIRTY_S = 2, NINETY_S = 3} type_samp;
@@ -28,6 +30,11 @@ struct config {
 static uint8_t command = 0;
 static uint8_t delta = 0;
 static uint32_t time_remain = 0;
+static uint8_t buffer[256 * 8];
+static struct {
+    float temperature;
+    uint32_t log_time;
+} stack_temperature[512];
 
 static inline uint8_t setting_slave(void); /* set slave before start modality master */
 static inline void state_slave();
@@ -121,12 +128,26 @@ static inline uint8_t setting_slave(void) {
     return command;
 }
 
+/* at each cycle read slave state and if exceed a percentage slave stack then sync and save on an internal array */
 static inline void run_mode_slave(void) {
-    #define SIZE_STACK_SLAVE 256
     state_slave();
     if(delta > (SIZE_STACK_SLAVE / 100.f) * init.percentage) {
-        __BKPT(0);
-        
+        /* 0b10000000, bit 7 for call slave */
+        uint8_t command_call = '\x80';
+        HAL_UART_Transmit(&huart1, &command_call, 1, 100);
+        HAL_UART_Receive(&huart1, buffer, (uint16_t)((((SIZE_STACK_SLAVE / 100.f) * init.percentage) + 1) * 8), 2000);
+
+        for (uint16_t i = 0; i < ((SIZE_STACK_SLAVE / 100.f) * init.percentage) + 1; i++) {
+            /* first save on temp variables to allow overwrite if stack_temperature[i] is not zero */
+            uint32_t temp = 0;
+            uint32_t l_time = 0;
+            for (uint8_t j = 0; j < 4; j++) {
+                temp |= ((uint32_t)buffer[i * 8 + j] << (j * 8));
+                l_time |= ((uint32_t)buffer[i * 8 + j + 4] << (j * 8));
+            }
+            stack_temperature[i].temperature = (float)temp / 100;
+            stack_temperature[i].log_time = l_time;
+        }
     }
 
 }
