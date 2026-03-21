@@ -1,14 +1,17 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "master.h"
 #include "gpio.h"
 #include "stm32g4xx.h"
 #include "stm32g4xx_hal.h"
+#include "stm32g4xx_hal_def.h"
 #include "stm32g4xx_hal_uart.h"
 #include "usart.h"
 
 #define SIZE_STACK_SLAVE 256
+#define STACK_SIZE_INTERN 512
 
 typedef enum {KELVIN = 0, CELSIUS = 1} type_temp;
 typedef enum {NO_LOG = 0, LOG     = 1} type_log;
@@ -35,8 +38,10 @@ static uint8_t buffer[256 * 8];
 static struct {
     float temperature;
     uint32_t log_time;
-} stack_temperature[512];
-static uint16_t index_stack = 0;
+} stack_temperature[STACK_SIZE_INTERN];
+static uint16_t tail = 0;
+static uint16_t head = 0;
+static uint16_t delta_stack = 0;
 static uint32_t deadline = 0;
 static uint32_t temp_sampling_master = 12000;
 
@@ -44,6 +49,8 @@ static inline uint8_t setting_slave(void); /* set slave before start modality ma
 static inline void state_slave();
 static inline void run_mode_slave(void);
 static inline void run_mode_master(void);
+static inline void push_stack(float temperature, uint32_t log_time);
+static inline bool pull_stack(float *temperature, uint32_t *log_time);
 
 void MASTER_init() {
 MX_GPIO_Init();
@@ -138,7 +145,6 @@ static inline void run_mode_slave(void) {
     if(delta > (SIZE_STACK_SLAVE / 100.f) * init.percentage) {
         /* 0b10000000, bit 7 for call slave */
         uint8_t command_call = '\x80';
-        uint16_t temp_index = 0;
         HAL_UART_Transmit(&huart1, &command_call, 1, 100);
         HAL_UART_Receive(&huart1, buffer, (uint16_t)((((SIZE_STACK_SLAVE / 100.f) * init.percentage) + 1) * 8), 2000);
 
@@ -150,12 +156,8 @@ static inline void run_mode_slave(void) {
                 temp |= ((uint32_t)buffer[i * 8 + j] << (j * 8));
                 l_time |= ((uint32_t)buffer[i * 8 + j + 4] << (j * 8));
             }
-            stack_temperature[(i + index_stack) & 0x1ff].temperature = (float)temp / 100;
-            stack_temperature[(i + index_stack) & 0x1ff].log_time = l_time;
-            temp_index++;
+            push_stack((float)(temp / 100.f), l_time);
         }
-        index_stack += temp_index;
-        index_stack = index_stack & 0x1ff;
     }
 
 }
@@ -174,10 +176,7 @@ static inline void run_mode_master(void) {
             temp |= ((uint32_t)buffer[j] << (j * 8));
             l_time |= ((uint32_t)buffer[j + 4] << (j * 8));
         }
-        stack_temperature[(index_stack) & 0x1ff].temperature = (float)temp / 100;
-        stack_temperature[(index_stack) & 0x1ff].log_time = l_time;
-        index_stack++;
-        index_stack = index_stack & 0x1ff;
+        push_stack((float)(temp / 100.f), l_time);
     }
 }
 
@@ -190,4 +189,27 @@ static inline void state_slave(void) {
 
     delta = (uint8_t)(receive_status[0] | (receive_status[1] << 8) | (receive_status[2] << 16) | (receive_status[3] << 24));
     time_remain = (receive_status[4] | (receive_status[5] << 8) | (receive_status[6] << 16) | (receive_status[7] << 24));
+}
+
+/* With limit of 512 character. If the stack is full, new values overwrite old ones. */
+static inline void push_stack(float temperature, uint32_t log_time) {
+    stack_temperature[head].temperature = temperature;
+    stack_temperature[head].log_time = log_time;
+    head++;
+    head &= (STACK_SIZE_INTERN - 1);
+    if(delta_stack < STACK_SIZE_INTERN) delta_stack++;
+    else {
+        tail++;
+        tail &= (STACK_SIZE_INTERN - 1);
+    }
+}
+
+static inline bool pull_stack(float *temperature, uint32_t *log_time) {
+    if(delta_stack == 0) return false;
+    *temperature = stack_temperature[tail].temperature;
+    *log_time = stack_temperature[tail].log_time;
+    tail++;
+    tail &= (STACK_SIZE_INTERN - 1);
+    delta_stack--;
+    return true;
 }
