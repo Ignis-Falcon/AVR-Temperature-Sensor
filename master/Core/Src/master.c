@@ -4,6 +4,7 @@
 #include "master.h"
 #include "gpio.h"
 #include "stm32g4xx.h"
+#include "stm32g4xx_hal.h"
 #include "stm32g4xx_hal_uart.h"
 #include "usart.h"
 
@@ -22,7 +23,7 @@ struct config {
 } init = {
     .temperature = CELSIUS,
     .log_time = LOG,
-    .samp_time = TEN_S,
+    .samp_time = ZERO_S,
     .percentage = 10,
     .save_setting = true
 };
@@ -36,6 +37,8 @@ static struct {
     uint32_t log_time;
 } stack_temperature[512];
 static uint16_t index_stack = 0;
+static uint32_t deadline = 0;
+static uint32_t temp_sampling_master = 12000;
 
 static inline uint8_t setting_slave(void); /* set slave before start modality master */
 static inline void state_slave();
@@ -158,6 +161,24 @@ static inline void run_mode_slave(void) {
 }
 
 static inline void run_mode_master(void) {
+    uint32_t tick_time = HAL_GetTick();
+    if(tick_time > deadline) {
+        deadline += temp_sampling_master;
+        /* 0b10000000, bit 7 for call slave */
+        uint8_t command_call = '\x80';
+        HAL_UART_Transmit(&huart1, &command_call, sizeof(command_call), 100);
+        HAL_UART_Receive(&huart1, buffer, 8, 100);
+        uint32_t temp = 0;
+        uint32_t l_time = 0;
+        for (uint8_t j = 0; j < 4; j++) {
+            temp |= ((uint32_t)buffer[j] << (j * 8));
+            l_time |= ((uint32_t)buffer[j + 4] << (j * 8));
+        }
+        stack_temperature[(index_stack) & 0x1ff].temperature = (float)temp / 100;
+        stack_temperature[(index_stack) & 0x1ff].log_time = l_time;
+        index_stack++;
+        index_stack = index_stack & 0x1ff;
+    }
 }
 
 static inline void state_slave(void) {
