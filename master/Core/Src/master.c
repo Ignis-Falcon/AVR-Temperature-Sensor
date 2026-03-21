@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -6,7 +7,6 @@
 #include "gpio.h"
 #include "stm32g4xx.h"
 #include "stm32g4xx_hal.h"
-#include "stm32g4xx_hal_def.h"
 #include "stm32g4xx_hal_uart.h"
 #include "usart.h"
 
@@ -43,7 +43,7 @@ static uint16_t tail = 0;
 static uint16_t head = 0;
 static uint16_t delta_stack = 0;
 static uint32_t deadline = 0;
-static uint32_t temp_sampling_master = 12000;
+static uint32_t temp_sampling_master = 200;
 
 static inline uint8_t setting_slave(void); /* set slave before start modality master */
 static inline void state_slave();
@@ -51,6 +51,7 @@ static inline void run_mode_slave(void);
 static inline void run_mode_master(void);
 static inline void push_stack(float temperature, uint32_t log_time);
 static inline bool pull_stack(float *temperature, uint32_t *log_time);
+static inline void sync_on_pc(void);
 
 void MASTER_init() {
 MX_GPIO_Init();
@@ -159,7 +160,7 @@ static inline void run_mode_slave(void) {
             push_stack((float)(temp / 100.f), l_time);
         }
     }
-
+    if(delta_stack == STACK_SIZE_INTERN - 1) sync_on_pc();
 }
 
 static inline void run_mode_master(void) {
@@ -178,6 +179,7 @@ static inline void run_mode_master(void) {
         }
         push_stack((float)(temp / 100.f), l_time);
     }
+    if(delta_stack == STACK_SIZE_INTERN - 1) sync_on_pc();
 }
 
 static inline void state_slave(void) {
@@ -212,4 +214,15 @@ static inline bool pull_stack(float *temperature, uint32_t *log_time) {
     tail &= (STACK_SIZE_INTERN - 1);
     delta_stack--;
     return true;
+}
+
+/* It doesn't set linker to support float on snprintf, so uses fmod */
+static inline void sync_on_pc(void) {
+    char buffer[20];
+    float temperature;
+    uint32_t log_time;
+    while(pull_stack(&temperature,&log_time)) {
+        uint8_t len = snprintf(buffer, sizeof(buffer), "%d.%d,%u\n", (int)temperature, (int)(fmod(temperature, 1.f) * 100), (unsigned int)log_time);
+        HAL_UART_Transmit(&huart2, (const uint8_t *)buffer, len, 1000);
+    }
 }
