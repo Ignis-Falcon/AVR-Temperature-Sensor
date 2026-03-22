@@ -1,3 +1,8 @@
+/* master.c - STM32 master firmware
+ * Manages communication with AVR slave via UART1,
+ * stores temperature samples in internal circular buffer,
+ * and outputs data via UART2.
+ */
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,40 +22,54 @@ typedef enum {KELVIN = 0, CELSIUS = 1} type_temp;
 typedef enum {NO_LOG = 0, LOG     = 1} type_log;
 typedef enum {ZERO_S = 0, TEN_S   = 1, THIRTY_S = 2, NINETY_S = 3} type_samp;
 
-struct config {
-    type_temp temperature;
-    type_log log_time;
-    type_samp samp_time;
-    bool save_setting;
-    uint8_t percentage;
+static struct config {
+    type_temp temperature; /* in celsius or kelvin */
+    type_log log_time; /* time sampling in second by start slave mode */
+    type_samp slave_sampling_time; /* in slave mode, time between two sampling */
+    uint32_t master_sampling_time; /* as above but for master mode */
+    bool save_setting; /* shows when necessity to save setting */
+    uint8_t percentage_to_sync; /* in slave mode, percentage to synching when slave stack reach this % */
 } init = {
     .temperature = CELSIUS,
     .log_time = LOG,
-    .samp_time = ZERO_S,
-    .percentage = 10,
+    .slave_sampling_time = NINETY_S,
+    .master_sampling_time = 50000,
+    .percentage_to_sync = 100,
     .save_setting = true
 };
 
-static uint8_t command = 0;
-static uint8_t delta = 0;
-static uint32_t time_remain = 0;
-static uint8_t buffer[256 * 8];
-static struct {
-    float temperature;
-    uint32_t log_time;
-} stack_temperature[STACK_SIZE_INTERN];
-static uint16_t tail = 0;
-static uint16_t head = 0;
-static uint16_t delta_stack = 0;
-static uint32_t deadline = 0;
-static uint32_t temp_sampling_master = 200;
+static uint8_t command_config = 0; /* command in 8bit to config slave */
+
+/* state variables of slave stack */
+static uint8_t delta_stack_slave = 0;
+static uint32_t time_remain_stack_slave = 0;
+
+static uint8_t buffer[SIZE_STACK_SLAVE * 8]; /* receive buffer, sized for max slave stack sync (256 samples * 8 bytes each) */
+
+static struct circular_buffer {
+    struct {
+        float temperature;
+        uint32_t log_time;
+    } ring[STACK_SIZE_INTERN]; /* circular buffer to save temperature and log_time */
+    uint16_t tail;
+    uint16_t head;
+    uint16_t delta;
+} circular_buf = {
+    .tail = 0,
+    .head = 0,
+    .delta = 0
+};
 
 static inline uint8_t setting_slave(void); /* set slave before start modality master */
 static inline void state_slave();
+
 static inline void run_mode_slave(void);
 static inline void run_mode_master(void);
+
+/* correlated to circular buffer */
 static inline void push_stack(float temperature, uint32_t log_time);
 static inline bool pull_stack(float *temperature, uint32_t *log_time);
+
 static inline void sync_on_pc(void);
 
 void MASTER_init() {
@@ -61,10 +80,10 @@ MX_USART2_UART_Init();
 
 void MASTER_run() {
     if(init.save_setting) {
-        command = setting_slave();
-        HAL_UART_Transmit(&huart1, &command, sizeof(command), 100);
+        command_config = setting_slave();
+        HAL_UART_Transmit(&huart1, &command_config, sizeof(command_config), 100);
     }
-    switch (init.samp_time) {
+    switch (init.slave_sampling_time) {
         case ZERO_S:
             run_mode_master();
             break;
@@ -104,7 +123,7 @@ static inline uint8_t setting_slave(void) {
     }
 
     /* bit 3-5: sampling interval (0=0s, 1=10s, 2=30s, 3+=90s) */
-    switch (init.samp_time) {
+    switch (init.slave_sampling_time) {
         case ZERO_S:
             CLEAR_BIT(command, 1 << 3);
             break;
@@ -128,7 +147,7 @@ static inline uint8_t setting_slave(void) {
     /* set save setting on slave */
     SET_BIT(command, 1 << 6);
     /* set slave mode: if samp 0 manual, else auto */
-    switch (init.samp_time) {
+    switch (init.slave_sampling_time) {
         case ZERO_S:
             CLEAR_BIT(command, 1 << 2);
             break;
@@ -143,14 +162,14 @@ static inline uint8_t setting_slave(void) {
 /* at each cycle read slave state and if exceed a percentage slave stack then sync and save on an internal array */
 static inline void run_mode_slave(void) {
     state_slave();
-    if(delta > (SIZE_STACK_SLAVE / 100.f) * init.percentage) {
+    if(delta_stack_slave > (SIZE_STACK_SLAVE / 100.f) * init.percentage_to_sync) {
         /* 0b10000000, bit 7 for call slave */
         uint8_t command_call = '\x80';
         HAL_UART_Transmit(&huart1, &command_call, 1, 100);
-        HAL_UART_Receive(&huart1, buffer, (uint16_t)((((SIZE_STACK_SLAVE / 100.f) * init.percentage) + 1) * 8), 2000);
+        HAL_UART_Receive(&huart1, buffer, (uint16_t)((((SIZE_STACK_SLAVE / 100.f) * init.percentage_to_sync) + 1) * 8), 2000);
 
-        for (uint16_t i = 0; i < ((SIZE_STACK_SLAVE / 100.f) * init.percentage) + 1; i++) {
-            /* first save on temp variables to allow overwrite if stack_temperature[i] is not zero */
+        for (uint16_t i = 0; i < ((SIZE_STACK_SLAVE / 100.f) * init.percentage_to_sync) + 1; i++) {
+            /* first save on temp variables to allow overwrite if circular_buf.ring[i] is not zero */
             uint32_t temp = 0;
             uint32_t l_time = 0;
             for (uint8_t j = 0; j < 4; j++) {
@@ -160,13 +179,14 @@ static inline void run_mode_slave(void) {
             push_stack((float)(temp / 100.f), l_time);
         }
     }
-    if(delta_stack == STACK_SIZE_INTERN - 1) sync_on_pc();
+    if(circular_buf.delta == STACK_SIZE_INTERN - 1) sync_on_pc();
 }
 
 static inline void run_mode_master(void) {
+    static uint32_t deadline;
     uint32_t tick_time = HAL_GetTick();
     if(tick_time > deadline) {
-        deadline += temp_sampling_master;
+        deadline += init.master_sampling_time;
         /* 0b10000000, bit 7 for call slave */
         uint8_t command_call = '\x80';
         HAL_UART_Transmit(&huart1, &command_call, sizeof(command_call), 100);
@@ -179,7 +199,7 @@ static inline void run_mode_master(void) {
         }
         push_stack((float)(temp / 100.f), l_time);
     }
-    if(delta_stack == STACK_SIZE_INTERN - 1) sync_on_pc();
+    if(circular_buf.delta == STACK_SIZE_INTERN - 1) sync_on_pc();
 }
 
 static inline void state_slave(void) {
@@ -189,34 +209,34 @@ static inline void state_slave(void) {
     HAL_UART_Transmit(&huart1, &command_state, sizeof(command_state), 100);
     HAL_UART_Receive(&huart1, receive_status, SIZE_RECEIVE_STATUS, 100);
 
-    delta = (uint8_t)(receive_status[0] | (receive_status[1] << 8) | (receive_status[2] << 16) | (receive_status[3] << 24));
-    time_remain = (receive_status[4] | (receive_status[5] << 8) | (receive_status[6] << 16) | (receive_status[7] << 24));
+    delta_stack_slave = (uint8_t)(receive_status[0] | (receive_status[1] << 8) | (receive_status[2] << 16) | (receive_status[3] << 24));
+    time_remain_stack_slave = (receive_status[4] | (receive_status[5] << 8) | (receive_status[6] << 16) | (receive_status[7] << 24));
 }
 
 /* With limit of 512 character. If the stack is full, new values overwrite old ones. */
 static inline void push_stack(float temperature, uint32_t log_time) {
-    stack_temperature[head].temperature = temperature;
-    stack_temperature[head].log_time = log_time;
-    head++;
-    head &= (STACK_SIZE_INTERN - 1);
-    if(delta_stack < STACK_SIZE_INTERN) delta_stack++;
+    circular_buf.ring[circular_buf.head].temperature = temperature;
+    circular_buf.ring[circular_buf.head].log_time = log_time;
+    circular_buf.head++;
+    circular_buf.head &= (STACK_SIZE_INTERN - 1);
+    if(circular_buf.delta < STACK_SIZE_INTERN) circular_buf.delta++;
     else {
-        tail++;
-        tail &= (STACK_SIZE_INTERN - 1);
+        circular_buf.tail++;
+        circular_buf.tail &= (STACK_SIZE_INTERN - 1);
     }
 }
 
 static inline bool pull_stack(float *temperature, uint32_t *log_time) {
-    if(delta_stack == 0) return false;
-    *temperature = stack_temperature[tail].temperature;
-    *log_time = stack_temperature[tail].log_time;
-    tail++;
-    tail &= (STACK_SIZE_INTERN - 1);
-    delta_stack--;
+    if(circular_buf.delta == 0) return false;
+    *temperature = circular_buf.ring[circular_buf.tail].temperature;
+    *log_time = circular_buf.ring[circular_buf.tail].log_time;
+    circular_buf.tail++;
+    circular_buf.tail &= (STACK_SIZE_INTERN - 1);
+    circular_buf.delta--;
     return true;
 }
 
-/* It doesn't set linker to support float on snprintf, so uses fmod */
+/* float support not enabled in linker, temperature split in integer and decimal parts */
 static inline void sync_on_pc(void) {
     char buffer[20];
     float temperature;
