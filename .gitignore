@@ -12,3 +12,5 @@ Release/
 *.elf
 *.bin
 *.hex
+output.csv
+script.py

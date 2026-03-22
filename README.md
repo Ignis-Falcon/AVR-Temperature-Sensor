@@ -1,6 +1,7 @@
-# Temperature sensor on AVR (Arduino) operating in Slave Mode
-This project is an arduino programmed on bare metal, a device capable of sending temperature data, managed by a master, which provides configuration and requests data. The project is part of a bigger one that will add my STM32 as role of controller, with the capacity to elaborate and send data with st-link to be able to be used as needed.
+# AVR-STM32 Temperature Sensor System — Master/Slave UART
+This project is an arduino programmed on bare metal, a device capable of sending temperature data, managed by a master, which provides configuration and requests data. The STM32 as role of controller, collecting temperature samples from the slave and outputting data via serial.
 
+## Slave
 The system is built on an Arduino Uno R3, which handles temperature sensing through a 100kΩ NTC thermistor configured in a voltage divider circuit with a fixed 100kΩ resistor (98.1 kΩ). The analog input is processed by 10 bit ADC module.
 
 The communication works with UART protocol. The data packet that would contains commands is defined by a byte variable. Each bit has a meaning:
@@ -8,7 +9,7 @@ The communication works with UART protocol. The data packet that would contains 
 - bit 0:    measurement unit (Kelvin = 0, Celsius = 1),
 - bit 1:    state log time (no = 0, yes = 1),
 - bit 2:    sampling mode (manual = 0, automatic = 1),
-- bit 3-5:  number reppresenting time between two sampling (0s = 0, 10s = 1, 30s = 2, 90s = 3-8),
+- bit 3-5:  number representing time between two sampling (0s = 0, 10s = 1, 30s = 2, 90s = 3-8),
 - bit 6:    save setting in sram,
 - bit 7:    request data transmission.
 
@@ -28,10 +29,24 @@ It works for up to about 36 hours and 24 minutes, before the timer resets due to
 
 To query status of the stack the master can send 0x00 value: It receives a status of the stack, indicating the current number of elements occupied and remaining time before overwriting.
 
+## Master
+The master is programmed using STM32 HAL and manages communication with the slave via UART1. It operates in two modes depending on the sampling configuration:
+- **Slave mode**: the master periodically queries the slave stack status and synchronizes data when the stack reaches a configured percentage.
+- **Master mode**: the master requests a single sample from the slave at a fixed interval defined by `master_sampling_time`.
+
+Received data is stored in an internal ring buffer of 512 elements. When the buffer is full, the data is output via UART2 and can be readed by any serial terminal.
+
 **To do:**
 - [x] ~~implement state command for the AVR to monitor the stack more other information,~~
 - [x] ~~fix timing reset of sync or in general as required by the master,~~
-- [ ] program my STM32 as master,
+- [x] ~~program my STM32 as master,~~
+- [ ] RTC on STM32 for absolute timestamp and sync time via UART2 by pc,
+- [ ] CubeMonitor:
+    - set configuration,
+    - view history,
+    - save offline data,
+- [ ] manual mode, controlled by user,
+- [ ] optimization replacing HAL with LL one module at a time,
 - [ ] change communication protocol to I2C.
 
 
